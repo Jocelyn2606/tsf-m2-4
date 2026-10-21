@@ -28,8 +28,136 @@ ventas_test <- ventas_semana_train |>
 
 # Datos
 
+## La serie
+
+```{r}
+ventas_semana_train |>
+  autoplot(total) +
+  labs(x = NULL, y = "Ventas (pesos)")
+```
+
+## Estacionalidad anual
+
+```{r}
+ventas_semana_train |>
+  gg_season(total, period = "year") +
+  labs(x = NULL, y = "Ventas (pesos)")
+```
+
 # Transformación y outliers
 
+## Transformación
+
+```{r}
+lambda <- ventas_semana_train |>
+  features(total, features = guerrero) |>
+  pull(lambda_guerrero)
+
+lambda
+```
+
+```{r}
+ventas_semana_train |>
+  as_tibble() |>
+  mutate(
+    Original = total,
+    `Box-Cox` = box_cox(total, lambda),
+    Log = log(total)
+  ) |>
+  pivot_longer(c(Original, `Box-Cox`, Log),
+               names_to = "serie", values_to = "valor") |>
+  mutate(serie = factor(serie, levels = c("Original", "Box-Cox", "Log"))) |>
+  ggplot(aes(x = semana, y = valor)) +
+  geom_line() +
+  facet_wrap(~ serie, ncol = 1, scales = "free_y") +
+  labs(x = NULL, y = NULL)
+```
+
+```{r}
+ventas_semana_train |>
+  as_tibble() |>
+  mutate(
+    año = year(as.Date(semana)),
+    Original = total,
+    `Box-Cox` = box_cox(total, lambda),
+    Log = log(total)
+  ) |>
+  group_by(año) |>
+  summarise(across(c(Original, `Box-Cox`, Log), sd)) |>
+  mutate(across(c(Original, `Box-Cox`, Log), ~ round(.x / first(.x), 2)))
+```
+
+::: {.notes}
+Las ventas tienen tendencia creciente y un pico fuerte cada diciembre. La variación crece con el nivel, la desviación estándar de 2025 es 1.43. Es por esto que decidimos transformar.
+
+El λ de Guerrero fue 0.46 . Comparamos la desviación estándar de cada año, respecto a 2021 en tres versiones de la serie. En la original crece hasta 1.43, con log baja hasta 0.73 y con Box-Cox se queda entre 0.87 y 1.04 sin tendencia. Elegimos Box-Cox con λ = 0.46 porque es la única transformación con la que la variación de la serie se mantiene constante a lo largo de los años. Sin transformar, la variación crece con el nivel de ventas y con log se corrige de más y la variación disminuye.
+
+:::
+
+## Outliers
+
+```{r}
+desc_stl <- ventas_semana_train |>
+  model(stl = STL(box_cox(total, lambda) ~ season(period = "year"),
+                  robust = TRUE)) |>
+  components()
+
+outliers <- desc_stl |>
+  filter(
+    remainder < quantile(remainder, 0.25) - 3 * IQR(remainder) |
+    remainder > quantile(remainder, 0.75) + 3 * IQR(remainder)
+  )
+
+desc_stl |>
+  as_tibble() |>
+  ggplot(aes(x = semana, y = remainder)) +
+  geom_line() +
+  geom_point(data = as_tibble(outliers), color = "red", size = 2) +
+  labs(x = NULL, y = "Residuo de la STL")
+
+outliers |> select(semana, remainder)
+```
+
+## Reemplazo de outliers
+
+```{r}
+ventas_limpia <- ventas_semana_train |>
+  left_join(
+    desc_stl |> as_tibble() |> select(semana, trend, season_year),
+    by = "semana"
+  ) |>
+  mutate(total = if_else(
+    semana %in% outliers$semana,
+    inv_box_cox(trend + season_year, lambda),
+    total
+  )) |>
+  select(semana, total)
+
+train_limpia <- ventas_limpia |>
+  filter(semana <= yearweek("2026 W18"))
+```
+
+```{r}
+ventas_semana_train |>
+  autoplot(total, color = "grey60") +
+  autolayer(ventas_limpia, total, color = "black") +
+  geom_point(
+    data = as_tibble(ventas_limpia) |> filter(semana %in% outliers$semana),
+    aes(x = semana, y = total), color = "red", size = 2
+  ) +
+  labs(x = NULL, y = "Ventas (pesos)",
+       subtitle = "Gris: original · Negro: con outliers reemplazados")
+```
+
+::: {.notes}
+Detectamos outliers con el residuo de una STL robusta sobre la serie con Box-Cox (λ = 0.46). Marcamos como outlier toda semana con residuo a más de 3 rangos intercuartílicos de los cuartiles y salieron dos semanas:
+
+- 2021-W43 (finales de octubre): con ventas de ~$124,000 sin festivo ni patrón parecido en otros años, probablemente a causa de un evento.
+- 2026-W01: la semana 1 de 2026 empezó el 29 de diciembre, así que son días de fiestas. Estas semanas venden mucho más, por lo cual es un efecto de calendario que la estacionalidad anual no captura.
+
+Primero para reemplazarlas, probamos interpolar con ARIMA, pero en 2026-W01 copiaba el pico de 2025-W01 y casi no cambiaba el valor. Por lo tanto, decidimos reemplazar las semanas con tendencia + estacionalidad de la misma STL sin el residuo.
+
+:::
 # Modelado
 
 ## Benchmark {.smaller}

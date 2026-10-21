@@ -1,0 +1,63 @@
+---
+title: "Pronóstico de ventas semanales"
+subtitle: "Equipo 4"
+author:
+  - Valeria Guzmán
+  - Esteban Vega
+  - Jocelyn Jiménez
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(fpp3)
+```
+
+
+```{r}
+#| label: datos-split
+#| include: false
+load("datos/ventas_semana_train.RData")
+
+ventas_train <- ventas_semana_train |>
+  filter(semana <= yearweek("2026 W18"))
+
+ventas_test <- ventas_semana_train |>
+  filter(semana > yearweek("2026 W18"))
+```
+
+# Datos
+
+# Transformación y outliers
+
+# Modelado
+
+## Benchmark {.smaller}
+
+```{r}
+fit_benchmark <- ventas_train |>
+  model(
+    benchmark = decomposition_model(
+      STL(total ~ season(period = "year"), robust = TRUE),
+      RW(season_adjust ~ drift())
+    )
+  )
+
+fit_benchmark |> report()
+```
+
+# Evaluación
+
+## Benchmark en test
+
+```{r}
+fc_benchmark <- fit_benchmark |>
+  forecast(h = 12)
+
+fc_benchmark |>
+  accuracy(ventas_semana_train) |>
+  select(.model, RMSE, MAE, MAPE)
+```
+
+
+# Pronóstico final

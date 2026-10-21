@@ -1,14 +1,13 @@
-# [Nombre del equipo] — Proyecto Módulo [N]
+# Equipo 4 — Proyecto Módulo 2
 
-Repo de equipo para el proyecto del Módulo [N] del curso de Forecasting de
+Repo de equipo para el proyecto del Módulo 2 del curso de Forecasting de
 Series de Tiempo (ITESO).
 
 ## Integrantes
 
-- Nombre 1
-- Nombre 2
-- Nombre 3
-- Nombre 4
+- Jocelyn Jiménez Buenrostro
+- Valeria Guzmán Galván
+- Esteban Vega Campos
 
 ## Qué incluye este repo
 

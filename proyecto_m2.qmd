@@ -13,7 +13,6 @@ author:
 library(fpp3)
 ```
 
-
 ```{r}
 #| label: datos-split
 #| include: false
@@ -49,7 +48,7 @@ ventas_semana_train |>
 ## Transformación
 
 ```{r}
-lambda <- ventas_semana_train |>
+lambda <- ventas_train |>
   features(total, features = guerrero) |>
   pull(lambda_guerrero)
 
@@ -88,18 +87,25 @@ ventas_semana_train |>
 ```
 
 ::: {.notes}
-Las ventas tienen tendencia creciente y un pico fuerte cada diciembre. La variación crece con el nivel, la desviación estándar de 2025 es 1.43. Es por esto que decidimos transformar.
+Las ventas presentan una tendencia creciente y picos importantes hacia diciembre. Además, observamos cambios en la variabilidad de la serie, por lo que comparamos las ventas originales con las transformaciones logarítmica y Box-Cox.
 
-El λ de Guerrero fue 0.46 . Comparamos la desviación estándar de cada año, respecto a 2021 en tres versiones de la serie. En la original crece hasta 1.43, con log baja hasta 0.73 y con Box-Cox se queda entre 0.87 y 1.04 sin tendencia. Elegimos Box-Cox con λ = 0.46 porque es la única transformación con la que la variación de la serie se mantiene constante a lo largo de los años. Sin transformar, la variación crece con el nivel de ventas y con log se corrige de más y la variación disminuye.
+Calculamos el parámetro de Guerrero utilizando los datos de entrenamiento y obtuvimos lambda = 0.5310.
 
+Al comparar las desviaciones estándar anuales respecto a 2021, observamos que la serie original alcanza 1.43 en 2025, mientras que con log disminuye hasta 0.73. En cambio, con Box-Cox la variabilidad se mantiene relativamente estable entre 0.88 y 1.07 durante 2021-2025.
+
+Por ello, elegimos Box-Cox como una transformación adecuada para estabilizar la varianza. Posteriormente evaluamos su efecto sobre la precisión de los modelos.
 :::
 
 ## Outliers
 
 ```{r}
-desc_stl <- ventas_semana_train |>
-  model(stl = STL(box_cox(total, lambda) ~ season(period = "year"),
-                  robust = TRUE)) |>
+desc_stl <- ventas_train |>
+  model(
+    stl = STL(
+      box_cox(total, lambda) ~ season(period = "year"),
+      robust = TRUE
+    )
+  ) |>
   components()
 
 outliers <- desc_stl |>
@@ -123,14 +129,18 @@ outliers |> select(semana, remainder)
 ```{r}
 ventas_limpia <- ventas_semana_train |>
   left_join(
-    desc_stl |> as_tibble() |> select(semana, trend, season_year),
+    desc_stl |>
+      as_tibble() |>
+      select(semana, trend, season_year),
     by = "semana"
   ) |>
-  mutate(total = if_else(
-    semana %in% outliers$semana,
-    inv_box_cox(trend + season_year, lambda),
-    total
-  )) |>
+  mutate(
+    total = if_else(
+      semana %in% outliers$semana,
+      inv_box_cox(trend + season_year, lambda),
+      total
+    )
+  ) |>
   select(semana, total)
 
 train_limpia <- ventas_limpia |>
@@ -149,16 +159,112 @@ ventas_semana_train |>
        subtitle = "Gris: original · Negro: con outliers reemplazados")
 ```
 
+
 ::: {.notes}
-Detectamos outliers con el residuo de una STL robusta sobre la serie con Box-Cox (λ = 0.46). Marcamos como outlier toda semana con residuo a más de 3 rangos intercuartílicos de los cuartiles y salieron dos semanas:
+Detectamos valores atípicos utilizando los residuos de una descomposición STL robusta sobre la serie transformada con Box-Cox (λ = 0.5310).
 
-- 2021-W43 (finales de octubre): con ventas de ~$124,000 sin festivo ni patrón parecido en otros años, probablemente a causa de un evento.
-- 2026-W01: la semana 1 de 2026 empezó el 29 de diciembre, así que son días de fiestas. Estas semanas venden mucho más, por lo cual es un efecto de calendario que la estacionalidad anual no captura.
+Consideramos como outlier cualquier semana cuyo residuo estuviera por debajo del primer cuartil menos 3 rangos intercuartílicos, o por encima del tercer cuartil más 3 rangos intercuartílicos.
 
-Primero para reemplazarlas, probamos interpolar con ARIMA, pero en 2026-W01 copiaba el pico de 2025-W01 y casi no cambiaba el valor. Por lo tanto, decidimos reemplazar las semanas con tendencia + estacionalidad de la misma STL sin el residuo.
+Identificamos dos semanas:
 
+- 2021-W43: presentó ventas extraordinariamente altas respecto al comportamiento esperado. Podría estar relacionado con algún evento especial, aunque no conocemos la causa exacta.
+- 2026-W01: presentó ventas superiores a las esperadas. Este comportamiento podría estar relacionado con las festividades de fin de año.
+
+Decidimos reemplazar estos dos valores utilizando la suma de la tendencia y la estacionalidad estimadas por STL, sin incluir el residuo. Posteriormente aplicamos la transformación inversa de Box-Cox para regresar las ventas a su escala original.
+
+La detección y el reemplazo se realizaron utilizando únicamente los datos de entrenamiento, evitando incorporar información del periodo de prueba.
 :::
+
 # Modelado
+
+## Modelos ETS
+
+```{r}
+fit_ets <- ventas_train |>
+  model(
+    ETS_auto = ETS(total),
+    ETS_boxcox = ETS(box_cox(total, lambda))
+  )
+
+fit_ets
+```
+
+```{r}
+fit_ets |>
+  select(ETS_auto) |>
+  report()
+```
+
+```{r}
+fit_ets |>
+  select(ETS_boxcox) |>
+  report()
+```
+
+### ETS con datos limpios
+
+```{r}
+fit_ets_limpio <- train_limpia |>
+  model(
+    ETS_limpio = ETS(box_cox(total, lambda))
+  )
+
+fit_ets_limpio |>
+  report()
+```
+
+### Modelos STL + ETS
+
+```{r}
+fit_stl_ets <- train_limpia |>
+  model(
+    STL_ETS_auto = decomposition_model(
+      STL(
+        box_cox(total, lambda) ~ season(period = "year"),
+        robust = TRUE
+      ),
+      ETS(season_adjust ~ season("N"))
+    ),
+
+    STL_ETS_amortiguado = decomposition_model(
+      STL(
+        box_cox(total, lambda) ~ season(period = "year"),
+        robust = TRUE
+      ),
+      ETS(
+        season_adjust ~
+          error("A") + trend("Ad") + season("N")
+      )
+    )
+  )
+
+fit_stl_ets
+```
+
+```{r}
+fit_stl_ets |>
+  select(STL_ETS_auto) |>
+  report()
+
+fit_stl_ets |>
+  select(STL_ETS_amortiguado) |>
+  report()
+```
+
+
+::: {.notes}
+Probamos cinco modelos basados en ETS para evaluar el efecto de la transformación Box-Cox, el tratamiento de outliers y la estacionalidad anual.
+
+Los modelos ETS directos seleccionaron ETS(M,A,N) y ETS(M,N,N), ambos sin componente estacional, con MAPE entre 15.8% y 15.9%. El ETS con datos limpios tampoco mejoró la precisión.
+
+Por ello, probamos dos modelos STL + ETS. En ambos, STL separa la estacionalidad anual, ETS modela la serie ajustada y SNAIVE pronostica el componente estacional.
+
+El modelo STL + ETS automático obtuvo un MAPE de 12.8%, mientras que el modelo con tendencia amortiguada, ETS(A,Ad,N) + SNAIVE, alcanzó 11.5%.
+
+Elegimos el modelo con tendencia amortiguada como el mejor candidato de ETS porque obtuvo el menor MAPE, que es la métrica principal del concurso. Aunque el modelo automático tuvo un RMSE ligeramente menor, el amortiguado presentó el mejor MAPE y MAE.
+
+Estos resultados sugieren que incorporar la estacionalidad anual y amortiguar la tendencia mejora la precisión del pronóstico durante nuestro periodo de prueba.
+:::
 
 ## Benchmark {.smaller}
 
@@ -183,9 +289,49 @@ fc_benchmark <- fit_benchmark |>
   forecast(h = 12)
 
 fc_benchmark |>
-  accuracy(ventas_semana_train) |>
+  accuracy(ventas_test) |>
   select(.model, RMSE, MAE, MAPE)
 ```
 
+```{r}
+fc_ets <- fit_ets |>
+  forecast(h = 12)
+
+fc_ets |>
+  accuracy(ventas_test) |>
+  select(.model, RMSE, MAE, MAPE)
+```
+
+```{r}
+fc_ets_limpio <- fit_ets_limpio |>
+  forecast(h = 12)
+
+fc_ets_limpio |>
+  accuracy(ventas_test) |>
+  select(.model, RMSE, MAE, MAPE)
+```
+
+```{r}
+fc_stl_ets <- fit_stl_ets |>
+  forecast(h = 12)
+
+fc_stl_ets |>
+  accuracy(ventas_test) |>
+  select(.model, RMSE, MAE, MAPE) |>
+  arrange(MAPE)
+```
+
+```{r}
+comparacion_ets <- bind_rows(
+  fc_benchmark |> accuracy(ventas_test),
+  fc_ets |> accuracy(ventas_test),
+  fc_ets_limpio |> accuracy(ventas_test),
+  fc_stl_ets |> accuracy(ventas_test)
+) |>
+  select(.model, RMSE, MAE, MAPE) |>
+  arrange(MAPE)
+
+comparacion_ets
+```
 
 # Pronóstico final

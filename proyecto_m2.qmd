@@ -266,6 +266,159 @@ Elegimos el modelo con tendencia amortiguada como el mejor candidato de ETS porq
 Estos resultados sugieren que incorporar la estacionalidad anual y amortiguar la tendencia mejora la precisión del pronóstico durante nuestro periodo de prueba.
 :::
 
+## ARIMA: estacionariedad
+
+```{r}
+#| label: arima-estacionariedad
+#| echo: false
+estacionariedad <- train_limpia |>
+  features(box_cox(total, lambda), unitroot_ndiffs)
+
+d_arima <- estacionariedad$ndiffs[[1]]
+estacionariedad
+```
+
+KPSS recomienda **`r d_arima` diferencia regular** sobre la serie limpia
+transformada. La estacionalidad anual se modela con Fourier o STL.
+
+::: {.notes}
+Usamos las 278 semanas de entrenamiento, hasta 2026-W18. La transformación
+Box-Cox y el reemplazo de outliers ya se estimaron únicamente en ese periodo.
+unitroot_ndiffs utiliza pruebas KPSS para recomendar el número de diferencias;
+en estos datos recomienda d = 1. Esto no elimina por sí solo la estacionalidad
+anual. La ACF y PACF ayudan a inspeccionar la dependencia, pero elegimos p y q
+con AICc dentro de cada especificación ARIMA.
+:::
+
+## ACF y PACF tras diferenciar
+
+```{r}
+#| label: arima-acf-pacf
+#| echo: false
+#| fig-height: 4.5
+serie_arima <- train_limpia |>
+  mutate(
+    transformada = box_cox(total, lambda),
+    diferenciada = if (d_arima == 0L) transformada else
+      difference(transformada, differences = d_arima)
+  ) |>
+  filter(!is.na(diferenciada))
+
+serie_arima |>
+  gg_tsdisplay(diferenciada, plot_type = "partial", lag_max = 60)
+```
+
+::: {.notes}
+La diferencia regular reduce el crecimiento de largo plazo. Inspeccionamos
+hasta 60 rezagos para incluir aproximadamente un ciclo anual de 52 semanas.
+La serie diferenciada todavía puede contener estructura estacional; por ello
+no afirmamos que una sola diferencia convierta todos los residuos en ruido
+blanco. No fijamos p y q únicamente por un corte visual de la ACF o PACF.
+:::
+
+## ARIMA con Fourier {.smaller}
+
+```{r}
+#| label: arima-fourier
+#| echo: false
+# Mismos datos, lambda y d para que los cinco AICc sean comparables.
+# PDQ(0, 0, 0) evita buscar un ARIMA estacional de periodo anual.
+fit_fourier <- train_limpia |>
+  model(
+    K1 = ARIMA(box_cox(total, lambda) ~
+      fourier(period = "year", K = 1) + pdq(d = d_arima) +
+      PDQ(0, 0, 0), approximation = FALSE),
+    K2 = ARIMA(box_cox(total, lambda) ~
+      fourier(period = "year", K = 2) + pdq(d = d_arima) +
+      PDQ(0, 0, 0), approximation = FALSE),
+    K3 = ARIMA(box_cox(total, lambda) ~
+      fourier(period = "year", K = 3) + pdq(d = d_arima) +
+      PDQ(0, 0, 0), approximation = FALSE),
+    K4 = ARIMA(box_cox(total, lambda) ~
+      fourier(period = "year", K = 4) + pdq(d = d_arima) +
+      PDQ(0, 0, 0), approximation = FALSE),
+    K5 = ARIMA(box_cox(total, lambda) ~
+      fourier(period = "year", K = 5) + pdq(d = d_arima) +
+      PDQ(0, 0, 0), approximation = FALSE)
+  )
+
+tabla_aicc <- fit_fourier |>
+  glance() |>
+  select(.model, AICc) |>
+  arrange(AICc)
+
+mejor_fourier <- tabla_aicc$.model[[1]]
+fit_fourier_elegido <- fit_fourier |> select(all_of(mejor_fourier))
+
+knitr::kable(tabla_aicc, digits = 2)
+```
+
+Elegimos **`r mejor_fourier`** por el menor AICc del entrenamiento.
+
+::: {.notes}
+El año equivale aproximadamente a 52.18 semanas. Modelar esa estacionalidad
+con pares de senos y cosenos permite que ARIMA se ocupe de los errores, sin
+buscar términos AR y MA estacionales a un rezago tan largo. K controla la
+flexibilidad del patrón anual; probamos de uno a cinco pares.
+
+Mantenemos d = 1 en los cinco ajustes: no sería válido elegir K comparando
+AICc calculados con distinto número de diferencias. También mantenemos los
+mismos datos y lambda. Usamos la búsqueda escalonada predeterminada, con
+approximation = FALSE. K se elige antes de consultar los errores de prueba.
+El AICc de Fourier no se compara con el de STL o ETS.
+
+report() confirma una regresión con errores ARIMA(2,1,2) para K5.
+
+```{r}
+#| label: arima-fourier-report
+#| echo: false
+fit_fourier_elegido |> report()
+```
+
+Referencia: [FPP3, regresión armónica dinámica](https://otexts.com/fpp3/dynamic-regression.html#dynamic-harmonic-regression).
+:::
+
+## STL + ARIMA
+
+```{r}
+#| label: arima-stl
+#| echo: false
+fit_stl_arima <- train_limpia |>
+  model(
+    STL_ARIMA = decomposition_model(
+      STL(box_cox(total, lambda) ~ season(period = "year"),
+          robust = TRUE),
+      ARIMA(season_adjust ~ PDQ(0, 0, 0), approximation = FALSE),
+      SNAIVE(season_year ~ lag(52))
+    )
+  )
+
+```
+
+- STL robusta separa la estacionalidad anual.
+- Serie ajustada: **ARIMA(0,1,1) con deriva**.
+- Componente estacional: **SNAIVE con rezago de 52 semanas**.
+- Se conserva Box-Cox y el entrenamiento con outliers reemplazados.
+
+::: {.notes}
+Probamos otra forma de capturar la estacionalidad: STL robusta separa el
+patrón anual y ARIMA modela la serie ajustada. report() confirma
+ARIMA(0,1,1) con deriva para esa serie. El componente anual se pronostica
+mediante SNAIVE. Especificamos su rezago de 52 semanas, que es el redondeo
+entero utilizado por este método para datos semanales. Esto evita dejar
+implícito el redondeo de 52.18, sin ocultar advertencias.
+
+Los órdenes de STL + ARIMA pueden diferir de los de Fourier porque sus
+respuestas y sus maneras de representar la estacionalidad son distintas.
+No comparamos sus AICc: para elegir entre familias usamos el mismo test.
+
+```{r}
+#| label: arima-stl-report
+#| echo: false
+fit_stl_arima |> report()
+```
+:::
+
 ## Benchmark {.smaller}
 
 ```{r}
@@ -333,5 +486,153 @@ comparacion_ets <- bind_rows(
 
 comparacion_ets
 ```
+
+## ARIMA frente al benchmark
+
+```{r}
+#| label: arima-evaluacion
+#| echo: false
+fc_fourier <- fit_fourier_elegido |> forecast(h = 12)
+fc_stl_arima <- fit_stl_arima |> forecast(h = 12)
+
+stopifnot(
+  nrow(ventas_test) == 12L,
+  identical(fc_fourier$semana, ventas_test$semana),
+  identical(fc_stl_arima$semana, ventas_test$semana),
+  all(is.finite(fc_fourier$.mean)),
+  all(is.finite(fc_stl_arima$.mean))
+)
+
+comparacion_arima <- bind_rows(
+  fc_benchmark |> accuracy(ventas_semana_train),
+  fc_fourier |> accuracy(ventas_semana_train),
+  fc_stl_arima |> accuracy(ventas_semana_train)
+) |>
+  select(.model, RMSE, MAE, MAPE) |>
+  arrange(MAPE)
+
+knitr::kable(comparacion_arima, digits = c(0, 2, 2, 2))
+```
+
+::: {.notes}
+Los tres modelos se ajustan hasta 2026-W18 y pronostican exactamente
+2026-W19 a W30. accuracy recibe las ventas observadas originales, sin
+reemplazar outliers del test. La inversión de Box-Cox la realiza fable,
+por lo que todos los errores se calculan sobre ventas en pesos.
+
+STL + ARIMA es el mejor de nuestros dos candidatos ARIMA: MAPE de
+`r round(comparacion_arima$MAPE[comparacion_arima$.model == "STL_ARIMA"], 2)`%,
+frente a `r round(comparacion_arima$MAPE[comparacion_arima$.model == mejor_fourier], 2)`%
+de Fourier y `r round(comparacion_arima$MAPE[comparacion_arima$.model == "benchmark"], 2)`%
+del benchmark. El menor AICc de K5 solo justificaba elegirlo entre los
+Fourier probados; no garantizaba un menor error que STL en datos nuevos.
+:::
+
+## Diagnóstico de ARIMA {.smaller}
+
+```{r}
+#| label: arima-diagnostico
+#| echo: false
+# Descontar los términos AR/MA estimados; Fourier no añade órdenes ARMA.
+dof_fourier <- fit_fourier_elegido |>
+  tidy() |>
+  filter(grepl("^(ar|ma)[0-9]+$", term)) |>
+  nrow()
+
+# Para Ljung-Box de STL diagnosticamos el ARIMA sobre season_adjust.
+fit_ajuste_arima <- train_limpia |>
+  model(stl = STL(box_cox(total, lambda) ~ season(period = "year"),
+                  robust = TRUE)) |>
+  components() |>
+  as_tibble() |>
+  select(semana, season_adjust) |>
+  as_tsibble(index = semana) |>
+  model(ajuste = ARIMA(season_adjust ~ PDQ(0, 0, 0),
+                       approximation = FALSE))
+
+dof_stl <- fit_ajuste_arima |>
+  tidy() |>
+  filter(grepl("^(ar|ma)[0-9]+$", term)) |>
+  nrow()
+
+diagnostico_arima <- bind_rows(
+  fit_fourier_elegido |> augment() |>
+    features(.innov, ljung_box, lag = 52, dof = dof_fourier),
+  fit_ajuste_arima |> augment() |>
+    features(.innov, ljung_box, lag = 52, dof = dof_stl) |>
+    mutate(.model = "STL_ARIMA (ajuste)")
+)
+
+knitr::kable(diagnostico_arima, digits = c(0, 2, 8))
+```
+
+Ambos diagnósticos detectan autocorrelación residual al 5%.
+
+::: {.notes}
+Ljung-Box contrasta ausencia de autocorrelación hasta el rezago 52,
+aproximadamente un año y menos de n/5 para este entrenamiento. Descontamos
+p + q grados de libertad en cada ARIMA; no contamos los pares Fourier
+como órdenes AR o MA. En STL contrastamos las innovaciones del ARIMA de la
+serie ajustada, antes de recombinar el componente estacional.
+
+El valor p de Fourier es menor que 0.05: queda autocorrelación residual.
+No presentamos ese modelo como completamente adecuado pese a su AICc.
+Para el ARIMA de la serie ajustada por STL el valor p es aproximadamente
+0.039: también se rechaza la hipótesis al 5%, aunque la evidencia es menos
+marcada. La mejora del MAPE frente al benchmark no implica que estos modelos
+hayan capturado toda la dependencia temporal. No afirmamos ruido blanco ni
+normalidad y reconocemos este límite del ajuste.
+:::
+
+## Comparación de todos los modelos {.smaller}
+
+```{r}
+#| label: comparacion-todos
+#| echo: false
+comparacion_modelos <- bind_rows(
+  fc_benchmark |> accuracy(ventas_semana_train),
+  fc_ets |> accuracy(ventas_semana_train),
+  fc_ets_limpio |> accuracy(ventas_semana_train),
+  fc_stl_ets |> accuracy(ventas_semana_train),
+  fc_fourier |> accuracy(ventas_semana_train),
+  fc_stl_arima |> accuracy(ventas_semana_train)
+) |>
+  select(.model, RMSE, MAE, MAPE) |>
+  arrange(MAPE)
+
+modelo_elegido <- comparacion_modelos |>
+  filter(.model != "benchmark") |>
+  slice_min(MAPE, n = 1, with_ties = FALSE)
+
+mape_benchmark <- comparacion_modelos |>
+  filter(.model == "benchmark") |>
+  pull(MAPE)
+
+stopifnot(modelo_elegido$MAPE < mape_benchmark)
+knitr::kable(comparacion_modelos, digits = c(0, 2, 2, 2))
+```
+
+## Elección para el pronóstico final
+
+Elegimos **`r modelo_elegido$.model`**, con MAPE de
+**`r round(modelo_elegido$MAPE, 2)`%**.
+
+- Benchmark: `r round(mape_benchmark, 2)`%.
+- Reducción relativa del MAPE:
+  `r round(100 * (1 - modelo_elegido$MAPE / mape_benchmark), 1)`%.
+- Mejor candidato ARIMA: **STL + ARIMA**.
+
+::: {.notes}
+La métrica principal es MAPE, por lo que la elección global es
+STL + ETS con tendencia amortiguada, aunque STL + ARIMA tiene un RMSE
+ligeramente menor. No elegimos ARIMA solo por ser nuestra familia asignada.
+El modelo elegido no es el benchmark y sí lo supera en el mismo test.
+
+Esta es una selección con una sola ventana de validación de 12 semanas;
+no demuestra que el mismo orden de modelos se mantendrá en otros periodos.
+Para entregar, se debe reestimar la preparación y la estructura seleccionada
+con todos los datos hasta W30 y pronosticar W31 a W42. La generación y
+validación de equipo_4.RData corresponde a la sección final de Jocelyn.
+:::
 
 # Pronóstico final

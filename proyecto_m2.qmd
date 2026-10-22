@@ -265,6 +265,87 @@ Elegimos el modelo con tendencia amortiguada como el mejor candidato de ETS porq
 
 Estos resultados sugieren que incorporar la estacionalidad anual y amortiguar la tendencia mejora la precisión del pronóstico durante nuestro periodo de prueba.
 :::
+## Modelos ARIMA
+
+```{r}
+train_limpia |>
+  features(box_cox(total, lambda), unitroot_ndiffs)
+```
+
+```{r}
+train_limpia |>
+  gg_tsdisplay(
+    difference(box_cox(total, lambda)),
+    plot_type = "partial",
+    lag_max = 60
+  )
+```
+
+```{r}
+fit_fourier <- train_limpia |>
+  model(
+    K1 = ARIMA(
+      box_cox(total, lambda) ~
+        fourier(period = "year", K = 1) +
+        pdq(d = 1) + PDQ(0, 0, 0),
+      approximation = FALSE
+    ),
+    K2 = ARIMA(
+      box_cox(total, lambda) ~
+        fourier(period = "year", K = 2) +
+        pdq(d = 1) + PDQ(0, 0, 0),
+      approximation = FALSE
+    ),
+    K3 = ARIMA(
+      box_cox(total, lambda) ~
+        fourier(period = "year", K = 3) +
+        pdq(d = 1) + PDQ(0, 0, 0),
+      approximation = FALSE
+    ),
+    K4 = ARIMA(
+      box_cox(total, lambda) ~
+        fourier(period = "year", K = 4) +
+        pdq(d = 1) + PDQ(0, 0, 0),
+      approximation = FALSE
+    ),
+    K5 = ARIMA(
+      box_cox(total, lambda) ~
+        fourier(period = "year", K = 5) +
+        pdq(d = 1) + PDQ(0, 0, 0),
+      approximation = FALSE
+    )
+  )
+
+glance(fit_fourier) |>
+  select(.model, AICc) |>
+  arrange(AICc)
+```
+
+```{r}
+fit_fourier |>
+  select(K5) |>
+  report()
+```
+
+## STL + ARIMA
+
+```{r}
+fit_stl_arima <- train_limpia |>
+  model(
+    stl_arima = decomposition_model(
+      STL(
+        box_cox(total, lambda) ~ season(period = "year"),
+        robust = TRUE
+      ),
+      ARIMA(
+        season_adjust ~ PDQ(0, 0, 0),
+        approximation = FALSE
+      )
+    )
+  )
+
+fit_stl_arima |> report()
+```
 
 ## Benchmark {.smaller}
 
@@ -333,5 +414,69 @@ comparacion_ets <- bind_rows(
 
 comparacion_ets
 ```
+
+## Evaluación de ARIMA
+
+```{r}
+fc_fourier <- fit_fourier |>
+  select(K5) |>
+  forecast(h = 12)
+
+fc_stl_arima <- fit_stl_arima |>
+  forecast(h = 12)
+
+comparacion_arima <- bind_rows(
+  fc_benchmark |> accuracy(ventas_test),
+  fc_fourier |> accuracy(ventas_test),
+  fc_stl_arima |> accuracy(ventas_test)
+) |>
+  select(.model, RMSE, MAE, MAPE) |>
+  arrange(MAPE)
+
+comparacion_arima
+```
+
+::: {.notes}
+Probamos dos enfoques para representar la estacionalidad anual de las
+ventas semanales: Fourier con errores ARIMA y STL + ARIMA.
+
+En Fourier comparamos K de 1 a 5, manteniendo d = 1. Elegimos K = 5
+porque obtuvo el menor AICc del entrenamiento: 3170.63.
+report() confirmó errores ARIMA(2,1,2).
+
+En STL + ARIMA, la descomposición separa la estacionalidad anual.
+La serie ajustada se modeló con ARIMA(0,1,1) con deriva y el componente
+estacional se pronosticó con SNAIVE.
+
+Evaluamos ambos enfoques contra las ventas originales de las mismas
+12 semanas de prueba. STL + ARIMA obtuvo el menor MAPE entre nuestros
+candidatos: 12.7%, frente a 17.2% de Fourier y 32.0% del benchmark.
+:::
+## Comparación de todos los modelos
+
+```{r}
+comparacion_final <- bind_rows(
+  fc_benchmark |> accuracy(ventas_test),
+  fc_ets |> accuracy(ventas_test),
+  fc_ets_limpio |> accuracy(ventas_test),
+  fc_stl_ets |> accuracy(ventas_test),
+  fc_fourier |> accuracy(ventas_test),
+  fc_stl_arima |> accuracy(ventas_test)
+) |>
+  select(.model, RMSE, MAE, MAPE) |>
+  arrange(MAPE)
+
+comparacion_final
+```
+
+::: {.notes}
+Elegimos STL + ETS con tendencia amortiguada porque obtuvo el menor
+MAPE en las 12 semanas de prueba: 11.5%, frente a 12.7% de STL + ARIMA
+y 32.0% del benchmark.
+
+Aunque STL + ARIMA obtuvo un RMSE ligeramente menor, el ETS amortiguado
+presentó menor MAPE y MAE. La elección se basa en MAPE, que es la
+métrica principal del trabajo.
+:::
 
 # Pronóstico final

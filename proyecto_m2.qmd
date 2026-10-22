@@ -201,7 +201,7 @@ fit_ets |>
   report()
 ```
 
-### ETS con datos limpios
+## ETS con datos limpios {.smaller}
 
 ```{r}
 fit_ets_limpio <- train_limpia |>
@@ -213,7 +213,7 @@ fit_ets_limpio |>
   report()
 ```
 
-### Modelos STL + ETS
+## Modelos STL + ETS {.smaller}
 
 ```{r}
 fit_stl_ets <- train_limpia |>
@@ -265,7 +265,8 @@ Elegimos el modelo con tendencia amortiguada como el mejor candidato de ETS porq
 
 Estos resultados sugieren que incorporar la estacionalidad anual y amortiguar la tendencia mejora la precisión del pronóstico durante nuestro periodo de prueba.
 :::
-## Modelos ARIMA
+
+## ARIMA: estacionariedad
 
 ```{r}
 train_limpia |>
@@ -280,6 +281,8 @@ train_limpia |>
     lag_max = 60
   )
 ```
+
+## ARIMA con Fourier {.smaller}
 
 ```{r}
 fit_fourier <- train_limpia |>
@@ -327,7 +330,7 @@ fit_fourier |>
   report()
 ```
 
-## STL + ARIMA
+## STL + ARIMA {.smaller}
 
 ```{r}
 fit_stl_arima <- train_limpia |>
@@ -452,6 +455,7 @@ Evaluamos ambos enfoques contra las ventas originales de las mismas
 12 semanas de prueba. STL + ARIMA obtuvo el menor MAPE entre nuestros
 candidatos: 12.7%, frente a 17.2% de Fourier y 32.0% del benchmark.
 :::
+
 ## Comparación de todos los modelos
 
 ```{r}
@@ -479,4 +483,191 @@ presentó menor MAPE y MAE. La elección se basa en MAPE, que es la
 métrica principal del trabajo.
 :::
 
+## Diagnóstico de residuales
+
+```{r}
+fit_stl_ets |>
+  select(STL_ETS_amortiguado) |>
+  gg_tsresiduals(lag_max = 60)
+```
+
+```{r}
+fit_stl_ets |>
+  select(STL_ETS_amortiguado) |>
+  augment() |>
+  features(.innov, ljung_box, lag = 55)
+```
+
+::: {.notes}
+Revisamos los residuos del modelo final STL + ETS amortiguado en el entrenamiento.
+
+La prueba de Ljung-Box con 55 rezagos dio un p-valor de 0.224, mayor a 0.05: no hay evidencia de autocorrelación, así que el modelo capturó la estructura de la serie. En la ACF solo dos rezagos se salen ligeramente de las bandas, lo esperado por azar en 60 rezagos.
+
+Los residuos se ven centrados en cero y con varianza estable, lo que confirma
+que Box-Cox estabilizó la varianza. Quedan algunos residuos grandes, probablemente semanas con festivos móviles como Semana Santa, que la
+estacionalidad anual no captura.
+
+El primer año no tiene residuos porque la estacionalidad se pronostica con SNAIVE, que necesita un año previo.
+:::
+
 # Pronóstico final
+
+## Limpieza con todos los datos
+
+```{r}
+lambda_total <- ventas_semana_train |>
+  features(total, features = guerrero) |>
+  pull(lambda_guerrero)
+
+stl_total <- ventas_semana_train |>
+  model(stl = STL(box_cox(total, lambda_total) ~ season(period = "year"),
+                  robust = TRUE)) |>
+  components()
+
+outliers_total <- stl_total |>
+  filter(
+    remainder < quantile(remainder, 0.25) - 3 * IQR(remainder) |
+    remainder > quantile(remainder, 0.75) + 3 * IQR(remainder)
+  )
+
+ventas_limpia_total <- ventas_semana_train |>
+  left_join(
+    stl_total |> as_tibble() |> select(semana, trend, season_year),
+    by = "semana"
+  ) |>
+  mutate(total = if_else(
+    semana %in% outliers_total$semana,
+    inv_box_cox(trend + season_year, lambda_total),
+    total
+  )) |>
+  select(semana, total)
+
+lambda_total
+outliers_total |> select(semana, remainder)
+```
+
+## Modelo final
+
+```{r}
+fit_final <- ventas_limpia_total |>
+  model(
+    equipo_4 = decomposition_model(
+      STL(
+        box_cox(total, lambda_total) ~ season(period = "year"),
+        robust = TRUE
+      ),
+      ETS(
+        season_adjust ~ error("A") + trend("Ad") + season("N")
+      )
+    )
+  )
+
+fit_final |>
+  report()
+```
+
+::: {.notes}
+El modelo final es STL + ETS(A,Ad,N), el que obtuvo el menor MAPE en nuestro
+test: 11.5%, contra 12.7% de STL + ARIMA y 32.0% del benchmark.
+
+Para el pronóstico lo volvimos a estimar con todos los datos (hasta 2026-W30).
+Antes repetimos el mismo procedimiento sobre la serie completa: λ de Guerrero
+(0.46), STL robusta y detección de outliers. Salieron las mismas dos semanas,
+2021-W43 y 2026-W01, y las reemplazamos igual que antes.
+
+report() confirma que se estimó lo que especificamos: STL con Box-Cox, la serie
+desestacionalizada con ETS(A,Ad,N) y la estacionalidad con SNAIVE.
+
+La tendencia amortiguada (Ad) hace que el crecimiento se vaya frenando a lo
+largo del horizonte, en lugar de proyectarlo en línea recta. En el test le ganó
+a la tendencia sin amortiguar: 11.5% contra 12.8% de MAPE.
+
+Con el train, phi fue 0.91; con todos los datos salió 0.98. Es decir, con la
+información más reciente el modelo amortigua menos la tendencia y espera que el
+crecimiento continúe casi al mismo ritmo.
+:::
+
+## Pronóstico de las siguientes 12 semanas
+
+```{r}
+equipo_4 <- fit_final |>
+  forecast(h = 12)
+
+equipo_4
+```
+
+```{r}
+equipo_4 |>
+  autoplot(ventas_semana_train |> filter(semana >= yearweek("2025 W01"))) +
+  labs(
+    title = "Pronóstico final de ventas semanales",
+    x = "Semana",
+    y = "Ventas (pesos)"
+  )
+```
+
+## Validación del pronóstico
+
+```{r}
+validar_entrega <- function(fc, nombre, maestria = FALSE,
+                            inicio = yearweek("2026 W31")) {
+  semanas_esperadas <- inicio + 0:11
+  problemas <- character()
+
+  if (!inherits(fc, "fbl_ts")) {
+    stop("El objeto no es un fable (fbl_ts). Debe ser la salida de forecast().")
+  }
+
+  idx <- fc[[index_var(fc)]]
+  if (!inherits(idx, "yearweek")) {
+    problemas <- c(problemas, "El índice no es de clase yearweek.")
+  }
+
+  modelos <- unique(fc$.model)
+  if (length(modelos) != 1 || modelos[1] != nombre) {
+    problemas <- c(problemas, sprintf(
+      "Debe haber un solo modelo llamado '%s'. Se encontró: %s",
+      nombre, paste(modelos, collapse = ", ")
+    ))
+  }
+
+  if (nrow(fc) != 12 ||
+      !isTRUE(all.equal(sort(as.Date(idx)), as.Date(semanas_esperadas)))) {
+    problemas <- c(problemas,
+      paste("El pronóstico debe cubrir exactamente 12 semanas, de",
+            format(inicio), "a", format(inicio + 11)))
+  }
+
+  if (!identical(response_vars(fc), "total")) {
+    problemas <- c(problemas, "La variable pronosticada debe llamarse 'total'.")
+  }
+
+  if (anyNA(fc$.mean) || any(fc$.mean <= 0)) {
+    problemas <- c(problemas, "Hay pronósticos faltantes, negativos o en cero.")
+  }
+
+  if (maestria) {
+    v <- distributional::variance(fc[[distribution_var(fc)]])
+    if (anyNA(v) || any(v <= 0)) {
+      problemas <- c(problemas,
+        "La distribución del pronóstico es degenerada: no hay intervalos válidos.")
+    }
+  }
+
+  if (length(problemas) == 0) {
+    message("✔ Entrega válida.")
+  } else {
+    stop(paste0("✖ ", problemas, collapse = "\n"))
+  }
+  invisible(TRUE)
+}
+```
+
+```{r}
+validar_entrega(equipo_4, "equipo_4")
+```
+
+```{r}
+save(equipo_4, file = "equipo_4.RData")
+```
+
